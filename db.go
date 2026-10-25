@@ -65,19 +65,22 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	opened    bool          // true if Open() was called and Close() not yet called
-	syncState syncState
-	syncDiag  diagState
+	mu       sync.RWMutex
+	execSem  *semaphore.Weighted
+	path     string   // part to database
+	metaPath string   // Path to the database metadata.
+	db       *sql.DB  // target database
+	f        *os.File // long-running db file descriptor
+	rtx      *sql.Tx  // long running read transaction
+	pageSize int      // page size, in bytes
+	// Runs inside a snapshotting sync once its read lock is held and before
+	// the database file is read; tests stand a foreign checkpoint in it.
+	snapshotHook func()
+	notify       chan struct{} // closes on WAL change
+	chkMu        sync.RWMutex  // checkpoint lock
+	opened       bool          // true if Open() was called and Close() not yet called
+	syncState    syncState
+	syncDiag     diagState
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -2108,6 +2111,25 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		defer db.chkMu.RUnlock()
 	}
 
+	// A snapshot copies pages straight from the database file. A checkpoint
+	// by another connection would backfill frames newer than the commit this
+	// LTX names into the file while the copy runs, and the file would carry
+	// pages the commit does not cover. The long-running read lock holds the
+	// readers' mark against that; while it is released (a checkpoint of our
+	// own in flight), a read transaction of this sync's own holds it for the
+	// length of the copy.
+	if info.snapshotting && db.rtx == nil && db.db != nil {
+		tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
+		if err != nil {
+			return result, fmt.Errorf("begin snapshot read lock: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+			_ = rollback(tx)
+			return result, fmt.Errorf("snapshot read lock: %w", err)
+		}
+		defer func() { _ = rollback(tx) }()
+	}
+
 	fi, err := db.f.Stat()
 	if err != nil {
 		return result, err
@@ -2246,6 +2268,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = true
 				s.reason = info.reason
 			})
+		if db.snapshotHook != nil {
+			db.snapshotHook()
+		}
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
