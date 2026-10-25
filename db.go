@@ -770,17 +770,30 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 // SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
 // replica. Blocks until both stages complete.
 func (db *DB) SyncAndWait(ctx context.Context) error {
+	_, err := db.SyncAndWaitPos(ctx)
+	return err
+}
+
+// SyncAndWaitPos is SyncAndWait reporting the local position the replica sync
+// covered: the replica holds at least that position when the call returns.
+// The database may have moved past it meanwhile, so a caller that compares
+// the replica against the local head reads the covered position instead.
+func (db *DB) SyncAndWaitPos(ctx context.Context) (ltx.Pos, error) {
 	if db.Replica == nil {
-		return fmt.Errorf("no replica configured")
+		return ltx.Pos{}, fmt.Errorf("no replica configured")
 	}
 
 	if err := db.Sync(ctx); err != nil {
-		return fmt.Errorf("db sync: %w", err)
+		return ltx.Pos{}, fmt.Errorf("db sync: %w", err)
+	}
+	pos, err := db.Pos()
+	if err != nil {
+		return ltx.Pos{}, fmt.Errorf("db position: %w", err)
 	}
 	if err := db.Replica.Sync(ctx); err != nil {
-		return fmt.Errorf("replica sync: %w", err)
+		return ltx.Pos{}, fmt.Errorf("replica sync: %w", err)
 	}
-	return nil
+	return pos, nil
 }
 
 // EnsureExists restores the database from the configured replica if the local
