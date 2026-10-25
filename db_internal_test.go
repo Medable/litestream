@@ -2101,6 +2101,100 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	}
 }
 
+func TestDB_execCheckpoint_ReacquireError(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	var err error
+	if db.db, err = sql.Open("sqlite", db.Path()); err != nil {
+		t.Fatal(err)
+	}
+	defer db.db.Close()
+	defer func() {
+		if err := db.releaseReadLock(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := db.db.Exec(`PRAGMA journal_mode = wal; CREATE TABLE _litestream_seq (id INTEGER);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.acquireReadLock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`DROP TABLE _litestream_seq;`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = db.execCheckpoint(ctx, "PASSIVE")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error=%v, want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "reacquire read lock") {
+		t.Fatalf("checkpoint error=%v, want reacquire read lock error", err)
+	}
+}
+
+func TestDB_execCheckpoint_CanceledContextRestoresGuard(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := db.execCheckpoint(ctx, "PASSIVE"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error=%v, want context.Canceled", err)
+	}
+
+	if db.rtx == nil {
+		t.Fatal("missing checkpoint guard")
+	}
+	if _, err := db.rtx.ExecContext(context.Background(), `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+		t.Fatalf("checkpoint guard ended after canceled checkpoint: %v", err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+	var busy, log, checkpointed int
+	if err := sqldb.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE);`).Scan(&busy, &log, &checkpointed); err != nil {
+		t.Fatal(err)
+	} else if busy != 1 {
+		t.Fatalf("external checkpoint busy=%d, want 1", busy)
+	}
+	if err := db.SyncAndWait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE);`).Scan(&busy, &log, &checkpointed); err != nil {
+		t.Fatal(err)
+	} else if busy != 0 {
+		t.Fatalf("external checkpoint after close busy=%d, want 0", busy)
+	}
+}
+
 // TestDB_releaseReadLock_DoubleRollback verifies that calling releaseReadLock()
 // after the read transaction has already been rolled back does not return an error.
 // This can happen during shutdown when concurrent checkpoint and close operations
@@ -4993,5 +5087,108 @@ func TestDB_ConcurrentMetricOwners(t *testing.T) {
 	}
 	if got := gatherDBSeries(t, path); len(got) != 0 {
 		t.Fatalf("series remain after last close: %v", got)
+	}
+}
+
+// A snapshotting sync that runs with the long-running read lock released
+// (the sync after a checkpoint of our own, when the lock could not be
+// retaken) holds a read transaction of its own across the page copy, so a
+// checkpoint by another connection cannot backfill frames newer than the
+// snapshot's commit into the file while it is read.
+func TestDB_SnapshotHoldsReadLockAgainstForeignCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: filepath.Join(dir, "replica")}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(ctx) }()
+
+	app, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	for _, q := range []string{`PRAGMA journal_mode = wal;`, `PRAGMA busy_timeout = 50;`, `CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);`} {
+		if _, err := app.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grow := func(n int) {
+		t.Helper()
+		if _, err := app.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?) INSERT INTO t(v) SELECT randomblob(900) FROM c`, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grow(300)
+
+	// The first sync snapshots the whole database. It runs here the way the
+	// sync after a checkpoint runs: inside the checkpoint path, with the
+	// long-running read lock released.
+	if err := db.init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.releaseReadLock(); err != nil {
+		t.Fatal(err)
+	}
+	type checkpoint struct{ busy, log, checkpointed int }
+	var foreign checkpoint
+	var foreignErr error
+	var fired int
+	db.snapshotHook = func() {
+		fired++
+		grow(300)
+		foreignErr = app.QueryRow(`PRAGMA wal_checkpoint(PASSIVE);`).Scan(&foreign.busy, &foreign.log, &foreign.checkpointed)
+	}
+	exec, err := db.newSyncExecutor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.applySyncResult(result)
+	db.applySyncExecutor(exec, true)
+	if foreignErr != nil {
+		t.Fatalf("foreign checkpoint: %v", foreignErr)
+	}
+	if fired != 1 {
+		t.Fatalf("snapshotting syncs=%d, want 1", fired)
+	}
+	t.Logf("foreign checkpoint under the snapshot: %+v", foreign)
+	// The read transaction pins the frames the snapshot has not copied:
+	// the foreign checkpoint backfills up to that mark and no further.
+	if foreign.checkpointed >= foreign.log {
+		t.Fatalf("foreign checkpoint backfilled the whole WAL under the snapshot: %+v", foreign)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The snapshot restores to a database that checks whole.
+	restored := filepath.Join(dir, "restored.db")
+	if err := r.Restore(ctx, RestoreOptions{OutputPath: restored, TXID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := sql.Open("sqlite", restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	var verdict string
+	if err := check.QueryRow(`PRAGMA quick_check;`).Scan(&verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "ok" {
+		t.Fatalf("snapshot torn: quick_check=%q (foreign checkpoint %+v)", verdict, foreign)
 	}
 }
