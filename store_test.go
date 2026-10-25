@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -764,4 +765,51 @@ func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
 	if err := <-client.drained; err != nil {
 		require.ErrorIs(t, err, context.Canceled)
 	}
+}
+
+// A sync with wait reports the position the replica sync covered. Another
+// sync (the monitor's, another caller's) may write a later LTX file while
+// the replica upload runs; a report of that later head beside a replicated
+// position below it would read as the caller's own transaction unconfirmed.
+func TestStore_SyncDB_WaitReportsCoveredPosition(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	s := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	s.CompactionMonitorEnabled = false
+	if err := s.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(t.Context())
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		row := strings.Repeat("x", 4096)
+		for ctx.Err() == nil {
+			if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (v) VALUES (?)`, row); err != nil {
+				return
+			}
+			_ = db.Sync(ctx)
+		}
+	}()
+
+	for i := 0; i < 300; i++ {
+		result, err := s.SyncDB(t.Context(), db.Path(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.ReplicatedTXID < result.TXID {
+			t.Fatalf("iteration %d: reported txid %d past the replicated txid %d", i, result.TXID, result.ReplicatedTXID)
+		}
+	}
+	cancel()
+	wg.Wait()
 }
