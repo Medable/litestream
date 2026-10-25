@@ -466,19 +466,25 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
 	}
 
+	var afterTXID ltx.TXID
 	if wait {
-		if err := db.SyncAndWait(ctx); err != nil {
+		// The position reported is the one the replica sync covered, not the
+		// local head afterwards: a sync by the monitor or by another caller may
+		// have written a later LTX file meanwhile that the replica does not
+		// hold yet, and a caller reading TXID > ReplicatedTXID would take its
+		// own, replicated transaction as unconfirmed.
+		pos, err := db.SyncAndWaitPos(ctx)
+		if err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
+		afterTXID = pos.TXID
 	} else {
 		if err := db.Sync(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
-	}
-
-	_, afterTXID, err := db.MaxLTX()
-	if err != nil {
-		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
+		if _, afterTXID, err = db.MaxLTX(); err != nil {
+			return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
+		}
 	}
 
 	var replicatedTXID uint64
