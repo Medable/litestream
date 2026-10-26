@@ -735,7 +735,8 @@ type DBConfig struct {
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
 	MaxSyncWALBytes    *int64         `yaml:"max-sync-wal-bytes"`
 
-	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
+	RestoreIfDBNotExists bool  `yaml:"restore-if-db-not-exists"`
+	ResumeFromReplica    *bool `yaml:"resume-from-replica"`
 
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
@@ -781,6 +782,9 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MaxSyncWALBytes != nil {
 		db.MaxSyncWALBytes = *dbc.MaxSyncWALBytes
+	}
+	if dbc.ResumeFromReplica != nil {
+		db.ResumeFromReplica = *dbc.ResumeFromReplica
 	}
 
 	// Instantiate and attach replica.
