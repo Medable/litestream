@@ -172,6 +172,15 @@ type DB struct {
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
 
+	// ResumeFromReplica declares that the database file is the replica head's
+	// state, written by a restore of this replica, and that nothing but WAL
+	// frames has been written since. When the local position is behind the
+	// replica, the head LTX file is fetched and re-encoded for the current
+	// WAL (its header salts, the WAL start) so replication continues from the
+	// head incrementally instead of snapshotting the whole database. A head
+	// whose page count differs from the file's falls back to the snapshot.
+	ResumeFromReplica bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -1749,7 +1758,141 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		"min_txid", minTXID,
 		"max_txid", maxTXID)
 
+	if db.ResumeFromReplica {
+		if err := db.adoptReplicaHead(localPath); err != nil {
+			db.Logger.Warn("replica head not adopted, snapshotting", "error", err)
+		} else {
+			db.Logger.Info("resuming from replica head", "txid", maxTXID)
+		}
+	}
+
 	return nil
+}
+
+// adoptReplicaHead re-encodes the fetched head LTX file at localPath with the
+// current WAL's header salts and a position at the WAL start, so the next
+// sync reads the WAL incrementally from its first frame instead of
+// snapshotting. The file's pages are copied as they are; only the header
+// changes. The head's page count must equal the database file's, and every
+// page the head carries must read the same in the database file (page 1
+// aside from the fields a restore and an open rewrite: the journal mode,
+// the change counter and the version-valid-for number), since the restore
+// applied the head last.
+func (db *DB) adoptReplicaHead(localPath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open head: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode head header: %w", err)
+	}
+	hdr := dec.Header()
+
+	dbFile, err := os.Open(db.Path())
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer func() { _ = dbFile.Close() }()
+	fi, err := dbFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat database: %w", err)
+	}
+	if hdr.PageSize == 0 || fi.Size()%int64(hdr.PageSize) != 0 || uint32(fi.Size()/int64(hdr.PageSize)) != hdr.Commit {
+		return fmt.Errorf("database has %d bytes, head commit is %d pages of %d bytes", fi.Size(), hdr.Commit, hdr.PageSize)
+	}
+
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return fmt.Errorf("read wal header: %w", err)
+	}
+
+	tmpPath := localPath + ".adopt"
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create adopted head: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	enc, err := ltx.NewEncoder(out)
+	if err != nil {
+		_ = out.Close()
+		return fmt.Errorf("new encoder: %w", err)
+	}
+	hdr.WALOffset = WALHeaderSize
+	hdr.WALSize = 0
+	hdr.WALSalt1 = binary.BigEndian.Uint32(walHdr[16:])
+	hdr.WALSalt2 = binary.BigEndian.Uint32(walHdr[20:])
+	if err := enc.EncodeHeader(hdr); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("encode adopted header: %w", err)
+	}
+	data := make([]byte, hdr.PageSize)
+	current := make([]byte, hdr.PageSize)
+	for {
+		var phdr ltx.PageHeader
+		if err := dec.DecodePage(&phdr, data); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			_ = out.Close()
+			return fmt.Errorf("decode head page: %w", err)
+		}
+		if _, err := dbFile.ReadAt(current, int64(phdr.Pgno-1)*int64(hdr.PageSize)); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("read database page %d: %w", phdr.Pgno, err)
+		}
+		if !headPageMatches(phdr.Pgno, data, current) {
+			_ = out.Close()
+			return fmt.Errorf("database page %d differs from the replica head", phdr.Pgno)
+		}
+		if err := enc.EncodePage(phdr, data); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("encode adopted page: %w", err)
+		}
+	}
+	if err := dec.Close(); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("close head decoder: %w", err)
+	}
+	enc.SetPostApplyChecksum(dec.Trailer().PostApplyChecksum)
+	if err := enc.Close(); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("close adopted encoder: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("sync adopted head: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close adopted head: %w", err)
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename adopted head: %w", err)
+	}
+	db.invalidatePosCache()
+	return nil
+}
+
+// headPageMatches reports whether a page the replica head carries reads the
+// same in the database file. On page 1 the bytes a restore and an open
+// rewrite are left out: the journal mode (18-19), the change counter
+// (24-27) and the version-valid-for number (92-95).
+func headPageMatches(pgno uint32, head, current []byte) bool {
+	if pgno != 1 {
+		return bytes.Equal(head, current)
+	}
+	if len(head) != len(current) || len(head) < 96 {
+		return false
+	}
+	skip := func(i int) bool { return (i >= 18 && i < 20) || (i >= 24 && i < 28) || (i >= 92 && i < 96) }
+	for i := range head {
+		if !skip(i) && head[i] != current[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // verify ensures the current LTX state matches where it left off from

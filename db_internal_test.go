@@ -5192,3 +5192,221 @@ func TestDB_SnapshotHoldsReadLockAgainstForeignCheckpoint(t *testing.T) {
 		t.Fatalf("snapshot torn: quick_check=%q (foreign checkpoint %+v)", verdict, foreign)
 	}
 }
+
+// A database restored to the replica head resumes replication from the head
+// when the caller says so: the fetched head file is re-encoded for the new
+// WAL, the next sync ships the new frames only, and a restore of the
+// replica afterwards holds them. Without the flag, or when the database
+// file does not read as the head, the next sync snapshots as before.
+func TestDB_ResumeFromReplica(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(t *testing.T) (replicaDir string, headTXID ltx.TXID) {
+		t.Helper()
+		dbPath := filepath.Join(t.TempDir(), "seed.db")
+		replicaDir = t.TempDir()
+		db := NewDB(dbPath)
+		db.MonitorInterval = 0
+		db.ShutdownSyncTimeout = 0
+		db.Replica = NewReplica(db)
+		db.Replica.Client = &testReplicaClient{dir: replicaDir}
+		db.Replica.MonitorEnabled = false
+		db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+		sqldb, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range []string{`PRAGMA journal_mode = wal`, `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`} {
+			if _, err := sqldb.Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < 200; i++ {
+			if _, err := sqldb.Exec(`INSERT INTO t (v) VALUES (?)`, strings.Repeat("x", 512)); err != nil {
+				t.Fatal(err)
+			}
+			if i%40 == 0 {
+				if err := db.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pos, err := db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return replicaDir, pos.TXID
+	}
+
+	restore := func(t *testing.T, replicaDir, path string) {
+		t.Helper()
+		r := NewDB(path)
+		r.Replica = NewReplica(r)
+		r.Replica.Client = &testReplicaClient{dir: replicaDir}
+		r.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		if err := r.Replica.Restore(ctx, RestoreOptions{OutputPath: path}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	open := func(t *testing.T, replicaDir, path string, resume bool) (*DB, *sql.DB) {
+		t.Helper()
+		db := NewDB(path)
+		db.MonitorInterval = 0
+		db.ShutdownSyncTimeout = 0
+		db.ResumeFromReplica = resume
+		db.Replica = NewReplica(db)
+		db.Replica.Client = &testReplicaClient{dir: replicaDir}
+		db.Replica.MonitorEnabled = false
+		db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close(ctx) })
+		sqldb, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sqldb.Close() })
+		if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+			t.Fatal(err)
+		}
+		return db, sqldb
+	}
+
+	// The newest local L0 file: its header and the number of pages it
+	// carries. A snapshot written by the sync path carries every page of
+	// the database (its header names one transaction, not txid 1).
+	newestL0 := func(t *testing.T, db *DB) (ltx.Header, int) {
+		t.Helper()
+		_, max, err := db.MaxLTX()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(db.LTXPath(0, max, max))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		hdr := dec.Header()
+		data := make([]byte, hdr.PageSize)
+		pages := 0
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, data); errors.Is(err, io.EOF) {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			pages++
+		}
+		return hdr, pages
+	}
+	wholeDatabase := func(hdr ltx.Header, pages int) bool { return pages >= int(hdr.Commit)-1 }
+
+	t.Run("Resumes", func(t *testing.T) {
+		replicaDir, head := seed(t)
+		path := filepath.Join(t.TempDir(), "restored.db")
+		restore(t, replicaDir, path)
+		db, sqldb := open(t, replicaDir, path, true)
+		if _, err := sqldb.Exec(`INSERT INTO t (v) VALUES ('after-restore')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		hdr, pages := newestL0(t, db)
+		if wholeDatabase(hdr, pages) {
+			t.Fatalf("the sync after the restore wrote the whole database (%d of %d pages, txid %s)", pages, hdr.Commit, hdr.MaxTXID)
+		}
+		if hdr.MaxTXID != head+1 {
+			t.Fatalf("resumed at txid %s, head was %s", hdr.MaxTXID, head)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		again := filepath.Join(t.TempDir(), "again.db")
+		restore(t, replicaDir, again)
+		check, err := sql.Open("sqlite", again)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer check.Close()
+		var n int
+		if err := check.QueryRow(`SELECT count(*) FROM t WHERE v = 'after-restore'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("the row written after the resume is missing from a restore of the replica")
+		}
+		var total int
+		if err := check.QueryRow(`SELECT count(*) FROM t`).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		if total != 201 {
+			t.Fatalf("restored %d rows, want 201", total)
+		}
+	})
+
+	t.Run("WithoutFlagSnapshots", func(t *testing.T) {
+		replicaDir, _ := seed(t)
+		path := filepath.Join(t.TempDir(), "restored.db")
+		restore(t, replicaDir, path)
+		db, sqldb := open(t, replicaDir, path, false)
+		if _, err := sqldb.Exec(`INSERT INTO t (v) VALUES ('after-restore')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if hdr, pages := newestL0(t, db); !wholeDatabase(hdr, pages) {
+			t.Fatalf("expected the whole database after a restore without the flag, got %d of %d pages", pages, hdr.Commit)
+		}
+	})
+
+	t.Run("FileNotAtHeadSnapshots", func(t *testing.T) {
+		replicaDir, _ := seed(t)
+		path := filepath.Join(t.TempDir(), "restored.db")
+		restore(t, replicaDir, path)
+		// A page appended to the file: it no longer reads as the head.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(make([]byte, 4096)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, sqldb := open(t, replicaDir, path, true)
+		if _, err := sqldb.Exec(`INSERT INTO t (v) VALUES ('after-restore')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if hdr, pages := newestL0(t, db); !wholeDatabase(hdr, pages) {
+			t.Fatalf("expected the whole database for a file that is not the head, got %d of %d pages", pages, hdr.Commit)
+		}
+	})
+}
