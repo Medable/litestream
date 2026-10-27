@@ -1909,6 +1909,9 @@ func newWebDAVReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (
 	client.Username = username
 	client.Password = password
 	client.Path = path
+	if c.Timeout != nil {
+		client.Timeout = *c.Timeout
+	}
 
 	return client, nil
 }
