@@ -98,7 +98,13 @@ func (r *ResumableReader) Open() error {
 		return err
 	}
 	streamCtx, streamCancel := context.WithCancel(r.ctx)
-	rc, err = r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+	// A known size names the remaining bytes, so every open is a bounded
+	// Range request on every backend.
+	var size int64
+	if r.size > 0 {
+		size = r.size - r.offset
+	}
+	rc, err = r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, size)
 	if err != nil {
 		streamCancel()
 		return err
