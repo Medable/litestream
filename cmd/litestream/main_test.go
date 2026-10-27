@@ -23,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/webdav"
 )
 
 func TestMain_RunHelp(t *testing.T) {
@@ -3974,4 +3975,48 @@ func waitForCondition(timeout time.Duration, fn func() bool) bool {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func TestNewWebDAVReplicaFromConfig_Timeout(t *testing.T) {
+	parse := func(t *testing.T, extra string) *webdav.ReplicaClient {
+		t.Helper()
+		config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/db
+    replica:
+      type: webdav
+      webdav-url: https://dav.example.com
+      path: /ltx
+`+extra), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatal("unexpected replica type")
+		}
+		return client
+	}
+
+	t.Run("Default", func(t *testing.T) {
+		if got, want := parse(t, "").Timeout, webdav.DefaultTimeout; got != want {
+			t.Fatalf("Timeout=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("Configured", func(t *testing.T) {
+		if got, want := parse(t, "      timeout: 5m\n").Timeout, 5*time.Minute; got != want {
+			t.Fatalf("Timeout=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("Unlimited", func(t *testing.T) {
+		if got := parse(t, "      timeout: 0s\n").Timeout; got != 0 {
+			t.Fatalf("Timeout=%v, want 0", got)
+		}
+	})
 }
