@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1094,5 +1095,36 @@ func TestFetchPageIndex_ShortRead(t *testing.T) {
 		t.Fatal("expected an error for a truncated ltx file")
 	} else if !strings.Contains(err.Error(), "too short") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchPageIndex_BoundedReads(t *testing.T) {
+	// Every open names the byte count it needs: the estimated page index at
+	// the end of the file, then the exact page index when the estimate was
+	// short. An open-ended read would make a backend without Range support
+	// send the whole file for each.
+	const fileSize = int64(200 * 1024)
+	const indexSize = 64 * 1024
+	var calls [][2]int64
+	client := &mock.ReplicaClient{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			calls = append(calls, [2]int64{offset, size})
+			b := make([]byte, size)
+			binary.BigEndian.PutUint64(b[len(b)-ltx.TrailerSize-8:], indexSize)
+			return io.NopCloser(bytes.NewReader(b)), nil
+		},
+	}
+
+	_, _ = litestream.FetchPageIndex(context.Background(), client, &ltx.FileInfo{
+		Level:   1,
+		MinTXID: 1,
+		MaxTXID: 9,
+		Size:    fileSize,
+	})
+
+	tail := fileSize - litestream.DefaultEstimatedPageIndexSize
+	start := fileSize - ltx.TrailerSize - 8 - indexSize
+	if want := [][2]int64{{tail, fileSize - tail}, {start, fileSize - start}}; !slices.Equal(calls, want) {
+		t.Fatalf("OpenLTXFile calls=%v, want %v", calls, want)
 	}
 }

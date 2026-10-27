@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -72,6 +73,62 @@ func TestResumableReader(t *testing.T) {
 		}
 		if callCount != 2 {
 			t.Fatalf("expected 2 OpenLTXFile calls (original + reconnect), got %d", callCount)
+		}
+	})
+
+	t.Run("ReopenRequestsRemainingBytes", func(t *testing.T) {
+		// A reconnect asks the backend for the bytes from the current offset
+		// to the known end of the file, so a backend whose open-ended read
+		// is unbounded (a WebDAV server answering 200 to a Range request)
+		// transfers only what remains.
+		data := []byte("hello world")
+		var calls [][2]int64
+		client := &testLTXFileOpener{
+			OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+				calls = append(calls, [2]int64{offset, size})
+				if len(calls) == 1 {
+					return io.NopCloser(&errorAfterN{data: data, n: 5, err: fmt.Errorf("connection reset")}), nil
+				}
+				return io.NopCloser(bytes.NewReader(data[offset : offset+size])), nil
+			},
+		}
+
+		r := newTestResumableReader(client, int64(len(data)), data)
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("got %q, want %q", got, data)
+		}
+		if want := [][2]int64{{0, 0}, {5, int64(len(data)) - 5}}; !slices.Equal(calls, want) {
+			t.Fatalf("OpenLTXFile calls=%v, want %v", calls, want)
+		}
+	})
+
+	t.Run("ReopenWithUnknownSizeIsOpenEnded", func(t *testing.T) {
+		data := []byte("hello world")
+		var calls [][2]int64
+		client := &testLTXFileOpener{
+			OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+				calls = append(calls, [2]int64{offset, size})
+				if len(calls) == 1 {
+					return io.NopCloser(&errorAfterN{data: data, n: 5, err: fmt.Errorf("connection reset")}), nil
+				}
+				return io.NopCloser(bytes.NewReader(data[offset:])), nil
+			},
+		}
+
+		r := newTestResumableReader(client, 0, data)
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("got %q, want %q", got, data)
+		}
+		if want := [][2]int64{{0, 0}, {5, 0}}; !slices.Equal(calls, want) {
+			t.Fatalf("OpenLTXFile calls=%v, want %v", calls, want)
 		}
 	})
 

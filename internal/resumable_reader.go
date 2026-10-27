@@ -106,7 +106,11 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// connection was closed (the stream is nil after a retry).
 		if rc == nil {
 			streamCtx, streamCancel := context.WithCancel(r.ctx)
-			newRC, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+			var size int64
+			if r.size > 0 {
+				size = r.size - r.offset
+			}
+			newRC, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, size)
 			if err != nil {
 				streamCancel()
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
