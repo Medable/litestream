@@ -37,6 +37,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
+	fs.BoolVar(&opt.FollowPages, "follow-pages", false, "record the pages each applied file wrote in follow mode")
 	integrityCheck := fs.String("integrity-check", "none", "post-restore integrity check: none, quick, or full")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -418,6 +419,12 @@ Arguments:
 	-follow-interval DURATION
 	    Polling interval for follow mode.
 	    Defaults to 1s.
+
+	-follow-pages
+	    In follow mode, append the pages each applied LTX file wrote to
+	    the <output>-pages sidecar, so a consumer can copy only the
+	    changed pages. Each record is written while the database file
+	    is locked for the apply. Requires -f.
 
 	-parallelism NUM
 	    Deprecated. Accepted for compatibility but has no effect in 0.5.x.

@@ -3643,6 +3643,10 @@ type RestoreOptions struct {
 	// FollowInterval specifies how often to poll for new LTX files in follow mode.
 	FollowInterval time.Duration
 
+	// FollowPages makes follow mode record, in the <output>-pages sidecar,
+	// the pages each applied LTX file wrote. Requires Follow.
+	FollowPages bool
+
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode

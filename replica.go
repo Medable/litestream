@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,10 @@ type Replica struct {
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
+
+	// Path of the follow-mode pages sidecar. Empty unless
+	// RestoreOptions.FollowPages is set.
+	followPagesPath string
 
 	wg     sync.WaitGroup
 	cancel func()
@@ -615,8 +620,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -txid")
 	} else if opt.Follow && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
+	} else if opt.FollowPages && !opt.Follow {
+		return fmt.Errorf("cannot use -follow-pages without follow mode")
 	} else if opt.IntegrityCheck != IntegrityCheckNone && opt.IntegrityCheck != IntegrityCheckQuick && opt.IntegrityCheck != IntegrityCheckFull {
 		return fmt.Errorf("unsupported integrity check mode: %d", opt.IntegrityCheck)
+	}
+
+	r.followPagesPath = ""
+	if opt.FollowPages {
+		r.followPagesPath = FollowPagesPath(opt.OutputPath)
 	}
 
 	// In follow mode, if the database already exists, attempt crash recovery
@@ -1077,6 +1089,17 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 	defer internal.UnlockFile(f)
 
+	// With the pages sidecar, a "partial" record goes in before the first
+	// page write and an "ok" record after the last, both under the lock: a
+	// reader that holds the file sees a trailing "partial" record exactly
+	// when an apply did not complete.
+	var pgnos []uint32
+	if r.followPagesPath != "" {
+		if err := appendFollowPagesRecord(r.followPagesPath, info.MinTXID, info.MaxTXID, 0, false, nil); err != nil {
+			return fmt.Errorf("write pages file: %w", err)
+		}
+	}
+
 	for {
 		var phdr ltx.PageHeader
 		data := make([]byte, pageSize)
@@ -1084,6 +1107,9 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 			break
 		} else if err != nil {
 			return fmt.Errorf("decode page: %w", err)
+		}
+		if r.followPagesPath != "" {
+			pgnos = append(pgnos, phdr.Pgno)
 		}
 
 		if phdr.Pgno == 1 && len(data) >= 28 {
@@ -1111,7 +1137,15 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 		return fmt.Errorf("close decoder: %w", err)
 	}
 
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if r.followPagesPath != "" {
+		if err := appendFollowPagesRecord(r.followPagesPath, info.MinTXID, info.MaxTXID, hdr.Commit, true, pgnos); err != nil {
+			return fmt.Errorf("write pages file: %w", err)
+		}
+	}
+	return nil
 }
 
 // fillFollowGap attempts to bridge a gap in level 0 files by searching
@@ -1822,6 +1856,60 @@ func restoreCandidateBetter(curr, next *ltx.FileInfo) bool {
 		return next.Level > curr.Level
 	}
 	return next.CreatedAt.Before(curr.CreatedAt)
+}
+
+// FollowPagesPath returns the path to the follow-mode pages sidecar for the
+// given database path.
+func FollowPagesPath(outputPath string) string {
+	return outputPath + "-pages"
+}
+
+// appendFollowPagesRecord appends one line to the pages sidecar:
+//
+//	<minTXID> <maxTXID> <commit> <ok|partial> <pages>
+//
+// TXIDs are 16 hex digits, commit is the page count of the database after
+// the file, and pages are the page numbers the file wrote as ascending
+// comma-separated ranges ("1,4-9,12"). A "partial" record carries no pages.
+// The file is opened in append mode for each record, so a consumer may
+// truncate it while it holds the database file against the apply.
+func appendFollowPagesRecord(path string, minTXID, maxTXID ltx.TXID, commit uint32, ok bool, pgnos []uint32) error {
+	var b strings.Builder
+	status := "partial"
+	if ok {
+		status = "ok"
+	}
+	fmt.Fprintf(&b, "%s %s %d %s", minTXID, maxTXID, commit, status)
+	if len(pgnos) > 0 {
+		b.WriteByte(' ')
+		slices.Sort(pgnos)
+		for i := 0; i < len(pgnos); {
+			j := i
+			for j+1 < len(pgnos) && pgnos[j+1] <= pgnos[j]+1 {
+				j++
+			}
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if pgnos[j] == pgnos[i] {
+				fmt.Fprintf(&b, "%d", pgnos[i])
+			} else {
+				fmt.Fprintf(&b, "%d-%d", pgnos[i], pgnos[j])
+			}
+			i = j + 1
+		}
+	}
+	b.WriteByte('\n')
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // TXIDPath returns the path to the TXID sidecar file for the given database path.
