@@ -945,6 +945,15 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 		case <-ticker.C:
 			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
 			if err != nil {
+				// Files applied before the error stay applied. Record the
+				// position they reached so the next poll continues from it
+				// instead of applying them again over newer pages.
+				if newTXID > lastTXID {
+					if werr := WriteTXIDFile(outputPath, newTXID); werr != nil {
+						return fmt.Errorf("write txid file: %w", werr)
+					}
+					lastTXID = newTXID
+				}
 				if ctx.Err() != nil {
 					r.Logger().Info("follow mode stopped")
 					return nil
@@ -995,10 +1004,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 		// If there's a gap, try to fill it from higher compaction levels.
 		if info.MinTXID > currentTXID+1 {
 			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
+			currentTXID = bridgedTXID
 			if err != nil {
 				return closeLevel0(err)
 			}
-			currentTXID = bridgedTXID
 
 			// Re-check if this file is still needed after bridging.
 			if info.MaxTXID <= currentTXID {
@@ -1032,10 +1041,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 
 	if !sawLevel0 {
 		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize)
+		currentTXID = bridgedTXID
 		if err != nil {
 			return currentTXID, err
 		}
-		currentTXID = bridgedTXID
 	}
 
 	return currentTXID, nil
